@@ -15,6 +15,11 @@ from urllib.parse import unquote, urlsplit
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MARKDOWN_IMAGE = re.compile(r"!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^\s)]+))")
+MARKDOWN_REFERENCE_DEFINITION = re.compile(
+    r"^[ \t]{0,3}\[([^\]\n]+)\]:[ \t]*(?:<([^>\n]*)>|(\S+))(?=[ \t]|$)",
+    re.MULTILINE,
+)
+MARKDOWN_REFERENCE_IMAGE = re.compile(r"!\[([^\]\n]*)\](?:\[([^\]\n]*)\])?")
 DOCUMENTED_VIEWBOX = (0.0, 0.0, 1024.0, 1024.0)
 
 
@@ -46,6 +51,22 @@ def _image_references(markdown: str) -> list[tuple[int, str]]:
         )
         for match in MARKDOWN_IMAGE.finditer(markdown)
     ]
+    definitions: dict[str, str] = {}
+    for match in MARKDOWN_REFERENCE_DEFINITION.finditer(markdown):
+        label = " ".join(match.group(1).split()).casefold()
+        definitions.setdefault(label, match.group(2) or match.group(3) or "")
+
+    for match in MARKDOWN_REFERENCE_IMAGE.finditer(markdown):
+        if markdown[match.end() :].lstrip().startswith("("):
+            continue
+
+        label = match.group(2) or match.group(1)
+        source = definitions.get(" ".join(label.split()).casefold())
+        if source is not None:
+            references.append(
+                (markdown.count("\n", 0, match.start()) + 1, source)
+            )
+
     parser = _HTMLImageParser()
     parser.feed(markdown)
     parser.close()

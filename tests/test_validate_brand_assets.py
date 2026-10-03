@@ -89,6 +89,33 @@ class BrandAssetValidatorTests(unittest.TestCase):
             errors,
         )
 
+    def test_missing_reference_style_image_fails_with_location(self) -> None:
+        (self.root / "README.md").write_text(
+            "# Fixture\n\n![Logo][logo]\n\n[logo]: missing.png\n",
+            encoding="utf-8",
+        )
+
+        errors = validate(self.root)
+
+        self.assertTrue(
+            any(
+                "README.md:3" in error
+                and "missing.png" in error
+                and "does not exist" in error
+                for error in errors
+            ),
+            errors,
+        )
+
+    def test_valid_reference_style_image_passes(self) -> None:
+        (self.root / "README.md").write_text(
+            "# Fixture\n\n![Logo][Primary Logo]\n\n"
+            "[ primary   logo ]: assets/brand/png/t-primary-16.png\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(validate(self.root), [])
+
     def test_png_dimensions_must_match_filename_size(self) -> None:
         (self.root / "assets/brand/png/t-primary-32.png").write_bytes(_png(16, 16))
 
