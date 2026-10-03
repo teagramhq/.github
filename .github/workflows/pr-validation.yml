@@ -116,11 +116,22 @@ jobs:
             BASE_SHA="$(git -C "$GITHUB_WORKSPACE/base" rev-parse HEAD)"
           fi
 
-          python3 "$GITHUB_WORKSPACE/candidate/scripts/prepare_pr_merge.py" \
-            --candidate "$GITHUB_WORKSPACE/candidate" \
-            --base-repository "$GITHUB_WORKSPACE/base" \
-            --base-sha "$BASE_SHA" \
-            --head-sha "$HEAD_SHA"
+          actual_head="$(git -C "$GITHUB_WORKSPACE/candidate" rev-parse HEAD)"
+          if [[ "$actual_head" != "$HEAD_SHA" ]]; then
+            echo "::error::Checked out $actual_head but expected $HEAD_SHA"
+            exit 1
+          fi
+
+          git -C "$GITHUB_WORKSPACE/candidate" fetch --no-tags \
+            "$GITHUB_WORKSPACE/base" "$BASE_SHA:refs/remotes/base/target"
+          git -C "$GITHUB_WORKSPACE/candidate" diff --check "$BASE_SHA...$HEAD_SHA"
+          merged_tree="$(git -C "$GITHUB_WORKSPACE/candidate" merge-tree \
+            --write-tree "$HEAD_SHA" refs/remotes/base/target)"
+          if [[ ! "$merged_tree" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::Could not resolve PR merge tree: $merged_tree"
+            exit 1
+          fi
+          git -C "$GITHUB_WORKSPACE/candidate" read-tree --reset -u "$merged_tree"
 
       - name: Run validator fixtures
         working-directory: candidate

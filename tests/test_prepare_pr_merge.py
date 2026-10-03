@@ -5,9 +5,34 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
-from scripts.prepare_pr_merge import prepare_merge_result
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".github/workflows/pr-validation.yml"
+MERGE_STEP = "      - name: Check PR whitespace and prepare its merge result"
+
+
+def _merge_step_script() -> str:
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    step_start = lines.index(MERGE_STEP)
+    run_start = next(
+        index
+        for index in range(step_start, len(lines))
+        if lines[index] == "        run: |"
+    )
+
+    script_lines: list[str] = []
+    for line in lines[run_start + 1 :]:
+        if line.startswith("      - name: "):
+            break
+        if line.startswith("          "):
+            script_lines.append(line[10:])
+        elif not line.strip():
+            script_lines.append("")
+        else:
+            raise AssertionError(f"Unexpected indentation in workflow step: {line!r}")
+
+    return "\n".join(script_lines) + "\n"
 
 
 class PRMergePreparationTests(unittest.TestCase):
@@ -35,9 +60,9 @@ class PRMergePreparationTests(unittest.TestCase):
         }
 
         self.base.mkdir()
-        self._git(self.base, "init", "--quiet", "-b", "main")
-        (self.base / "base.txt").write_text("initial\n", encoding="utf-8")
-        self._git(self.base, "add", "base.txt", env=identity)
+        self._git(self.base, "init", "--quiet", "-b", "main", env=self.environment)
+        (self.base / "README.md").write_text("old candidate\n", encoding="utf-8")
+        self._git(self.base, "add", "README.md", env=self.environment)
         self._git(self.base, "commit", "--quiet", "-m", "initial", env=identity)
         subprocess.run(
             ["git", "clone", "--quiet", str(self.base), str(self.candidate)],
@@ -45,12 +70,21 @@ class PRMergePreparationTests(unittest.TestCase):
             env=self.environment,
         )
         self._git(self.candidate, "switch", "--quiet", "-c", "feature")
-        (self.candidate / "feature.txt").write_text("feature\n", encoding="utf-8")
-        self._git(self.candidate, "add", "feature.txt", env=identity)
-        self._git(self.candidate, "commit", "--quiet", "-m", "feature", env=identity)
+        (self.candidate / "pr-change.txt").write_text(
+            "candidate change\n", encoding="utf-8"
+        )
+        self._git(self.candidate, "add", "pr-change.txt", env=self.environment)
+        self._git(
+            self.candidate,
+            "commit",
+            "--quiet",
+            "-m",
+            "candidate change",
+            env=identity,
+        )
 
-        (self.base / "main.txt").write_text("main advanced\n", encoding="utf-8")
-        self._git(self.base, "add", "main.txt", env=identity)
+        (self.base / "main-change.txt").write_text("main advanced\n", encoding="utf-8")
+        self._git(self.base, "add", "main-change.txt", env=self.environment)
         self._git(self.base, "commit", "--quiet", "-m", "advance main", env=identity)
         self.base_sha = self._git(self.base, "rev-parse", "HEAD").stdout.strip()
         self.head_sha = self._git(self.candidate, "rev-parse", "HEAD").stdout.strip()
@@ -72,13 +106,15 @@ class PRMergePreparationTests(unittest.TestCase):
             env=env,
         )
 
-    def test_divergent_merge_prepares_tree_without_committer_identity(self) -> None:
+    def test_divergent_old_candidate_merges_without_candidate_ci_scripts(self) -> None:
+        self.assertFalse((self.candidate / "scripts/prepare_pr_merge.py").exists())
         self._git(
             self.candidate,
             "fetch",
             "--quiet",
             str(self.base),
             f"{self.base_sha}:refs/remotes/base/target",
+            env=self.environment,
         )
         merge_base = self._git(
             self.candidate, "merge-base", self.base_sha, self.head_sha
@@ -86,18 +122,28 @@ class PRMergePreparationTests(unittest.TestCase):
         self.assertNotEqual(merge_base, self.base_sha)
         self.assertNotEqual(merge_base, self.head_sha)
 
-        with patch.dict(os.environ, self.environment, clear=True):
-            prepare_merge_result(
-                self.candidate, self.base, self.base_sha, self.head_sha
-            )
+        environment = {
+            **self.environment,
+            "GITHUB_WORKSPACE": str(self.root),
+            "BASE_SHA": self.base_sha,
+            "HEAD_SHA": self.head_sha,
+        }
+        result = subprocess.run(
+            ["bash", "-c", _merge_step_script()],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
 
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            (self.candidate / "main.txt").read_text(encoding="utf-8"),
+            (self.candidate / "main-change.txt").read_text(encoding="utf-8"),
             "main advanced\n",
         )
         self.assertEqual(
-            (self.candidate / "feature.txt").read_text(encoding="utf-8"),
-            "feature\n",
+            (self.candidate / "pr-change.txt").read_text(encoding="utf-8"),
+            "candidate change\n",
         )
         self.assertEqual(
             self._git(self.candidate, "rev-parse", "HEAD").stdout.strip(),
