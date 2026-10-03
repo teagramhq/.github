@@ -18,11 +18,13 @@ Use it for the app icon, the GitHub avatar, favicons and anywhere Teagram needs 
 
 ## Companion: happy mug
 
-| Tea | Green | Sky |
-|---|---|---|
-| <img src="png/mug-tea-128.png" width="96" alt=""> | <img src="png/mug-green-128.png" width="96" alt=""> | <img src="png/mug-sky-128.png" width="96" alt=""> |
+| Signal | Tea | Green | Sky |
+|---|---|---|---|
+| <img src="png/mug-signal-128.png" width="96" alt=""> | <img src="png/mug-tea-128.png" width="96" alt=""> | <img src="png/mug-green-128.png" width="96" alt=""> | <img src="png/mug-sky-128.png" width="96" alt=""> |
 
-A friendly secondary mark, used as the hero image on the organization page and for stickers, empty states, docs and social posts. Never use it as the app icon or avatar, and never in orange.
+The **signal** version (`mug-signal`: signal arcs instead of steam) is the hero image on the organization page.
+
+A friendly secondary mark for stickers, empty states, docs and social posts. Never use it as the app icon or avatar, and never in orange.
 
 ## Files
 

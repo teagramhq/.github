@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/teagramhq/.github/main/assets/brand/png/mug-tea-256.png" width="128" height="128" alt="Teagram">
+  <img src="https://raw.githubusercontent.com/teagramhq/.github/main/assets/brand/png/mug-signal-256.png" width="128" height="128" alt="Teagram">
 </p>
 
 <h1 align="center">Teagram</h1>
