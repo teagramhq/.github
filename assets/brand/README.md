@@ -16,7 +16,7 @@ Use it for the app icon, the GitHub avatar, favicons and anywhere Teagram needs 
 | Mint `#34D399` on `#172033` to `#0A0F1A` | Green `#0F7A57` on `#F7FAF8` to `#E3EEE8` | Sky `#7DD3FC` on `#1E3A5F` to `#0B1A2E` |
 | Dark mode, developer pages | Light pages, print | Docs headers, slides |
 
-## Companion: winking mug
+## Companion: happy mug
 
 | Tea | Green | Sky |
 |---|---|---|
