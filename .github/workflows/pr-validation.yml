@@ -23,6 +23,8 @@ jobs:
     name: content
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      dispatched_head_sha: ${{ steps.revisions.outputs.head_sha }}
     permissions:
       contents: read
       pull-requests: read
@@ -33,7 +35,10 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           GH_TOKEN: ${{ github.token }}
@@ -46,32 +51,71 @@ jobs:
               exit 1
             fi
 
-            pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+            if ! pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+              echo "::error::Could not fetch PR #$PR_NUMBER metadata"
+              exit 1
+            fi
             if [[ "$(jq -r '.state' <<<"$pr")" != "open" ]]; then
               echo "::error::PR #$PR_NUMBER is not open"
               exit 1
             fi
 
-            base_sha="$(jq -r '.base.sha' <<<"$pr")"
+            pr_number="$PR_NUMBER"
+            base_branch="$(jq -r '.base.ref // empty' <<<"$pr")"
+            base_repository="$(jq -r '.base.repo.full_name // empty' <<<"$pr")"
             head_sha="$(jq -r '.head.sha' <<<"$pr")"
             head_repository="$(jq -r '.head.repo.full_name // empty' <<<"$pr")"
+
+            if [[ -z "$base_branch" || -z "$base_repository" ]]; then
+              echo "::error::PR #$PR_NUMBER is missing its target branch or repository"
+              exit 1
+            fi
+            if [[ "$base_repository" != "$GITHUB_REPOSITORY" ]]; then
+              echo "::error::PR #$PR_NUMBER targets unexpected repository $base_repository"
+              exit 1
+            fi
+
+            if ! target_commits="$(gh api --method GET "repos/$base_repository/commits" \
+              -f "sha=$base_branch" -F per_page=1)"; then
+              echo "::error::Could not resolve current tip for $base_repository/$base_branch"
+              exit 1
+            fi
+            base_sha="$(jq -r '.[0].sha // empty' <<<"$target_commits")"
           else
+            pr_number="$EVENT_PR_NUMBER"
+            base_branch="$EVENT_BASE_REF"
+            base_repository="$EVENT_BASE_REPOSITORY"
             base_sha="$EVENT_BASE_SHA"
             head_sha="$EVENT_HEAD_SHA"
             head_repository="$EVENT_HEAD_REPOSITORY"
           fi
 
-          if [[ -z "$base_sha" || -z "$head_sha" || -z "$head_repository" ]]; then
+          if [[ -z "$pr_number" || -z "$base_branch" || -z "$base_repository" \
+            || -z "$base_sha" || -z "$head_sha" || -z "$head_repository" ]]; then
             echo "::error::Could not resolve the pull request base and head"
+            exit 1
+          fi
+          if [[ ! "$base_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ \
+            || ! "$head_sha" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+            echo "::error::PR #$pr_number resolved an invalid base or head SHA"
             exit 1
           fi
 
           {
+            echo "pr_number=$pr_number"
+            echo "base_repository=$base_repository"
+            echo "base_branch=$base_branch"
             echo "base_ref=$base_sha"
             echo "base_sha=$base_sha"
             echo "head_sha=$head_sha"
             echo "head_repository=$head_repository"
           } >> "$GITHUB_OUTPUT"
+          {
+            echo "### PR #$pr_number validation revisions"
+            echo
+            echo "- Target: \`$base_repository/$base_branch\` at \`$base_sha\`"
+            echo "- Head: \`$head_repository\` at \`$head_sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Resolve pushed branch revisions
         id: branch_revisions
@@ -91,6 +135,7 @@ jobs:
       - name: Check out base
         uses: actions/checkout@v4
         with:
+          repository: ${{ steps.revisions.outputs.base_repository || github.repository }}
           ref: ${{ steps.revisions.outputs.base_ref || steps.branch_revisions.outputs.base_ref }}
           path: base
           fetch-depth: 0
@@ -109,6 +154,7 @@ jobs:
         env:
           BASE_SHA: ${{ steps.revisions.outputs.base_sha }}
           HEAD_SHA: ${{ steps.revisions.outputs.head_sha || steps.branch_revisions.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.revisions.outputs.pr_number }}
         run: |
           set -euo pipefail
 
@@ -125,8 +171,15 @@ jobs:
           git -C "$GITHUB_WORKSPACE/candidate" fetch --no-tags \
             "$GITHUB_WORKSPACE/base" "$BASE_SHA:refs/remotes/base/target"
           git -C "$GITHUB_WORKSPACE/candidate" diff --check "$BASE_SHA...$HEAD_SHA"
-          merged_tree="$(git -C "$GITHUB_WORKSPACE/candidate" merge-tree \
-            --write-tree "$HEAD_SHA" refs/remotes/base/target)"
+          if ! merged_tree="$(git -C "$GITHUB_WORKSPACE/candidate" merge-tree \
+            --write-tree "$HEAD_SHA" refs/remotes/base/target)"; then
+            if [[ -n "$PR_NUMBER" ]]; then
+              echo "::error::PR #$PR_NUMBER conflicts with target $BASE_SHA"
+            else
+              echo "::error::Changes conflict with target $BASE_SHA"
+            fi
+            exit 1
+          fi
           if [[ ! "$merged_tree" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
             echo "::error::Could not resolve PR merge tree: $merged_tree"
             exit 1
@@ -140,3 +193,39 @@ jobs:
       - name: Validate repository content
         working-directory: candidate
         run: python3 scripts/validate_brand_assets.py
+
+  verify-dispatched-head:
+    name: verify-dispatched-head
+    if: github.event_name == 'workflow_dispatch'
+    needs: content
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Confirm dispatched PR head is unchanged
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ needs.content.outputs.dispatched_head_sha }}
+        run: |
+          set -euo pipefail
+
+          if ! pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+            echo "::error::Could not verify PR #$PR_NUMBER head after validation"
+            exit 1
+          fi
+          if [[ "$(jq -r '.state' <<<"$pr")" != "open" ]]; then
+            echo "::error::PR #$PR_NUMBER closed during validation"
+            exit 1
+          fi
+          current_head="$(jq -r '.head.sha // empty' <<<"$pr")"
+          if [[ "$current_head" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "::error::PR #$PR_NUMBER head changed during validation: expected $EXPECTED_HEAD_SHA, found $current_head"
+            exit 1
+          fi
+          echo "PR #$PR_NUMBER remained open at head $EXPECTED_HEAD_SHA after validation."
+          {
+            echo "### Dispatch head verification"
+            echo
+            echo "- PR #$PR_NUMBER remained open at head \`$EXPECTED_HEAD_SHA\` after validation."
+          } >> "$GITHUB_STEP_SUMMARY"
