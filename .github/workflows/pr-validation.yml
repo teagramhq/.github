@@ -13,6 +13,10 @@ on:
         description: Open pull request number to validate against its base
         required: true
         type: number
+      head_sha:
+        description: Exact pull request head revision to validate
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -24,7 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
-      dispatched_head_sha: ${{ steps.revisions.outputs.head_sha }}
+      target_ref: ${{ steps.revisions.outputs.base_branch }}
+      target_sha: ${{ steps.revisions.outputs.base_sha }}
     permissions:
       contents: read
       pull-requests: read
@@ -41,6 +46,7 @@ jobs:
           EVENT_BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
           EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           EVENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          EXPECTED_HEAD_SHA: ${{ inputs.head_sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -65,6 +71,15 @@ jobs:
             base_repository="$(jq -r '.base.repo.full_name // empty' <<<"$pr")"
             head_sha="$(jq -r '.head.sha' <<<"$pr")"
             head_repository="$(jq -r '.head.repo.full_name // empty' <<<"$pr")"
+
+            if [[ ! "$EXPECTED_HEAD_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+              echo "::error::head_sha must be a full 40- or 64-character commit SHA"
+              exit 1
+            fi
+            if [[ "$head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
+              echo "::error::PR #$PR_NUMBER head changed: expected $EXPECTED_HEAD_SHA, found $head_sha"
+              exit 1
+            fi
 
             if [[ -z "$base_branch" || -z "$base_repository" ]]; then
               echo "::error::PR #$PR_NUMBER is missing its target branch or repository"
@@ -196,7 +211,7 @@ jobs:
 
   verify-dispatched-head:
     name: verify-dispatched-head
-    if: github.event_name == 'workflow_dispatch'
+    if: always() && !cancelled() && github.event_name == 'workflow_dispatch'
     needs: content
     runs-on: ubuntu-latest
     permissions:
@@ -206,7 +221,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
-          EXPECTED_HEAD_SHA: ${{ needs.content.outputs.dispatched_head_sha }}
+          EXPECTED_HEAD_SHA: ${{ inputs.head_sha }}
         run: |
           set -euo pipefail
 
@@ -229,3 +244,103 @@ jobs:
             echo
             echo "- PR #$PR_NUMBER remained open at head \`$EXPECTED_HEAD_SHA\` after validation."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-head-status:
+    name: publish-head-status
+    if: always() && !cancelled() && github.event_name == 'workflow_dispatch' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: [content, verify-dispatched-head]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: publish-pr-${{ inputs.pr_number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Publish dispatched PR status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.head_sha }}
+          EXPECTED_TARGET_REF: ${{ needs.content.outputs.target_ref }}
+          EXPECTED_TARGET_SHA: ${{ needs.content.outputs.target_sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          CONTENT_RESULT: ${{ needs.content.result }}
+          VERIFY_RESULT: ${{ needs.verify-dispatched-head.result }}
+          STATUS_CONTEXT: PR validation / dispatched-merge
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          SERVER_URL: ${{ github.server_url }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ \
+            || ! "$EXPECTED_HEAD_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ \
+            || ! "$EXPECTED_TARGET_SHA" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ \
+            || -z "$DEFAULT_BRANCH" || -z "$EXPECTED_TARGET_REF" ]]; then
+            echo "::error::Cannot publish status with missing or invalid pinned revisions"
+            exit 1
+          fi
+
+          if [[ "$EXPECTED_TARGET_REF" != "$DEFAULT_BRANCH" ]]; then
+            echo "::error::Pinned target $EXPECTED_TARGET_REF is not default branch $DEFAULT_BRANCH"
+            exit 1
+          fi
+
+          case "$CONTENT_RESULT:$VERIFY_RESULT" in
+            success:success)
+              state=success
+              result_description="validation passed"
+              ;;
+            failure:success|success:failure|failure:failure)
+              state=failure
+              if [[ "$CONTENT_RESULT" == "failure" && "$VERIFY_RESULT" == "failure" ]]; then
+                result_description="content validation and PR verification failed"
+              elif [[ "$CONTENT_RESULT" == "failure" ]]; then
+                result_description="content validation failed"
+              else
+                result_description="PR verification failed"
+              fi
+              ;;
+            *)
+              echo "No dispatched PR status published for content=$CONTENT_RESULT verify=$VERIFY_RESULT"
+              exit 0
+              ;;
+          esac
+
+          if ! pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"; then
+            echo "::error::Could not verify PR #$PR_NUMBER before status publication"
+            exit 1
+          fi
+          pr_state="$(jq -r '.state // empty' <<<"$pr")"
+          pr_base_repository="$(jq -r '.base.repo.full_name // empty' <<<"$pr")"
+          pr_base_ref="$(jq -r '.base.ref // empty' <<<"$pr")"
+          pr_head_sha="$(jq -r '.head.sha // empty' <<<"$pr")"
+          if [[ "$pr_state" != "open" || "$pr_base_repository" != "$GITHUB_REPOSITORY" \
+            || "$pr_base_ref" != "$EXPECTED_TARGET_REF" || "$pr_head_sha" != "$EXPECTED_HEAD_SHA" ]]; then
+            echo "::error::PR #$PR_NUMBER revision binding is stale or invalid"
+            exit 1
+          fi
+
+          if ! target_commits="$(gh api --method GET "repos/$GITHUB_REPOSITORY/commits" \
+            -f "sha=$DEFAULT_BRANCH" -F per_page=1)"; then
+            echo "::error::Could not verify current target tip for $DEFAULT_BRANCH"
+            exit 1
+          fi
+          live_target_sha="$(jq -r '.[0].sha // empty' <<<"$target_commits")"
+          if [[ "$live_target_sha" != "$EXPECTED_TARGET_SHA" ]]; then
+            echo "::error::Target branch advanced: expected $EXPECTED_TARGET_SHA, found $live_target_sha"
+            exit 1
+          fi
+
+          description="target $EXPECTED_TARGET_SHA; attempt $RUN_ATTEMPT; $result_description"
+          target_url="$SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT"
+          if ! status_response="$(gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/statuses/$EXPECTED_HEAD_SHA" \
+            -f "state=$state" -f "context=$STATUS_CONTEXT" \
+            -f "description=$description" -f "target_url=$target_url")"; then
+            echo "::error::Could not publish $state status for PR #$PR_NUMBER head $EXPECTED_HEAD_SHA"
+            exit 1
+          fi
+          echo "Published $state for PR #$PR_NUMBER at $EXPECTED_HEAD_SHA against $EXPECTED_TARGET_SHA (run $RUN_ID attempt $RUN_ATTEMPT)."

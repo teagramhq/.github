@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/pr-validation.yml"
 RESOLVE_STEP = "      - name: Resolve pull request revisions"
 MERGE_STEP = "      - name: Check PR whitespace and prepare its merge result"
+PUBLISH_STEP = "      - name: Publish dispatched PR status"
 
 
 def _workflow_step_script(step_name: str) -> str:
@@ -35,6 +36,22 @@ def _workflow_step_script(step_name: str) -> str:
             raise AssertionError(f"Unexpected indentation in workflow step: {line!r}")
 
     return "\n".join(script_lines) + "\n"
+
+
+def _workflow_job_text(job_name: str) -> str:
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    start = lines.index(f"  {job_name}:")
+    end = next(
+        (
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith("  ")
+            and len(lines[index]) > 2
+            and lines[index][2] != " "
+        ),
+        len(lines),
+    )
+    return "\n".join(lines[start:end]) + "\n"
 
 
 class PRMergePreparationTests(unittest.TestCase):
@@ -167,7 +184,10 @@ class PRMergePreparationTests(unittest.TestCase):
         gh.chmod(0o755)
 
     def _run_resolve_step(
-        self, *, fail_target_api: bool = False
+        self,
+        *,
+        fail_target_api: bool = False,
+        expected_head_sha: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, str], str]:
         output_file = self.root / "github_output"
         summary_file = self.root / "github_step_summary"
@@ -200,6 +220,7 @@ class PRMergePreparationTests(unittest.TestCase):
             "EVENT_BASE_REPOSITORY": "",
             "EVENT_HEAD_SHA": "",
             "EVENT_HEAD_REPOSITORY": "",
+            "EXPECTED_HEAD_SHA": expected_head_sha or self.head_sha,
             "GITHUB_REPOSITORY": "teagramhq/.github",
             "PR_METADATA_FILE": str(metadata_file),
             "EXPECTED_BASE_BRANCH": "main",
@@ -309,6 +330,13 @@ class PRMergePreparationTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Could not resolve current tip", result.stdout)
 
+    def test_dispatch_rejects_a_head_different_from_the_requested_sha(self) -> None:
+        result, outputs, _ = self._run_resolve_step(expected_head_sha="c" * 40)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("head changed", result.stdout)
+        self.assertEqual(outputs, {})
+
     def test_candidate_trailing_whitespace_fails_validation(self) -> None:
         (self.candidate / "pr-change.txt").write_text(
             "candidate change \n", encoding="utf-8"
@@ -328,6 +356,253 @@ class PRMergePreparationTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("trailing whitespace", result.stdout + result.stderr)
+
+
+class PRStatusPublisherTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.fake_bin = self.root / "bin"
+        self.fake_bin.mkdir()
+        self.pr_file = self.root / "pull_request.json"
+        self.calls_file = self.root / "api_calls.json"
+        self.calls_file.write_text("[]", encoding="utf-8")
+        self.head_sha = "a" * 40
+        self.target_sha = "b" * 40
+        self._install_fake_gh()
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def _install_fake_gh(self) -> None:
+        gh = self.fake_bin / "gh"
+        gh.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "args = sys.argv[1:]\n"
+            "method = args[args.index('--method') + 1] if '--method' in args else 'GET'\n"
+            "endpoint = next((arg for arg in args if arg.startswith('repos/')), '')\n"
+            "params = {}\n"
+            "for index, arg in enumerate(args[:-1]):\n"
+            "    if arg in ('-f', '-F') and '=' in args[index + 1]:\n"
+            "        key, value = args[index + 1].split('=', 1)\n"
+            "        params[key] = value\n"
+            "calls_path = Path(os.environ['API_CALLS_FILE'])\n"
+            "calls = json.loads(calls_path.read_text(encoding='utf-8'))\n"
+            "calls.append({'method': method, 'endpoint': endpoint, 'params': params})\n"
+            "calls_path.write_text(json.dumps(calls), encoding='utf-8')\n"
+            "repo = os.environ['GITHUB_REPOSITORY']\n"
+            "if method == 'GET' and endpoint == f\"repos/{repo}/pulls/{os.environ['PR_NUMBER']}\":\n"
+            "    if os.environ.get('FAIL_API') == 'pull':\n"
+            "        print('pull request API unavailable', file=sys.stderr)\n"
+            "        sys.exit(1)\n"
+            "    print(Path(os.environ['PR_JSON_FILE']).read_text(encoding='utf-8'))\n"
+            "elif method == 'GET' and endpoint == f\"repos/{repo}/commits\":\n"
+            "    if os.environ.get('FAIL_API') == 'target':\n"
+            "        print('target API unavailable', file=sys.stderr)\n"
+            "        sys.exit(1)\n"
+            "    if params.get('sha') != os.environ['DEFAULT_BRANCH'] or params.get('per_page') != '1':\n"
+            "        print('unexpected target revision query', file=sys.stderr)\n"
+            "        sys.exit(2)\n"
+            "    print(json.dumps([{'sha': os.environ['LIVE_TARGET_SHA']}]))\n"
+            "elif method == 'POST' and endpoint == f\"repos/{repo}/statuses/{os.environ['EXPECTED_HEAD_SHA']}\":\n"
+            "    if os.environ.get('FAIL_API') == 'status':\n"
+            "        print('status API unavailable', file=sys.stderr)\n"
+            "        sys.exit(1)\n"
+            "    print(json.dumps({'id': len(calls), **params}))\n"
+            "else:\n"
+            "    print(f'unexpected gh command: {args}', file=sys.stderr)\n"
+            "    sys.exit(2)\n",
+            encoding="utf-8",
+        )
+        gh.chmod(0o755)
+
+    def _run_publisher(
+        self,
+        *,
+        content_result: str = "success",
+        verify_result: str = "success",
+        pr_state: str = "open",
+        pr_base_repository: str = "teagramhq/.github",
+        pr_base_ref: str = "main",
+        pr_head_sha: str | None = None,
+        live_target_sha: str | None = None,
+        expected_head_sha: str | None = None,
+        expected_target_sha: str | None = None,
+        expected_target_ref: str = "main",
+        default_branch: str = "main",
+        fail_api: str = "",
+    ) -> subprocess.CompletedProcess[str]:
+        head_sha = expected_head_sha or self.head_sha
+        target_sha = expected_target_sha or self.target_sha
+        self.pr_file.write_text(
+            json.dumps(
+                {
+                    "state": pr_state,
+                    "base": {
+                        "ref": pr_base_ref,
+                        "repo": {"full_name": pr_base_repository},
+                    },
+                    "head": {"sha": pr_head_sha or head_sha},
+                }
+            ),
+            encoding="utf-8",
+        )
+        environment = {
+            "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
+            "GITHUB_REPOSITORY": "teagramhq/.github",
+            "PR_NUMBER": "7",
+            "EXPECTED_HEAD_SHA": head_sha,
+            "EXPECTED_TARGET_REF": expected_target_ref,
+            "EXPECTED_TARGET_SHA": target_sha,
+            "DEFAULT_BRANCH": default_branch,
+            "CONTENT_RESULT": content_result,
+            "VERIFY_RESULT": verify_result,
+            "STATUS_CONTEXT": "PR validation / dispatched-merge",
+            "RUN_ATTEMPT": "2",
+            "RUN_ID": "12345",
+            "SERVER_URL": "https://github.com",
+            "LIVE_TARGET_SHA": live_target_sha or target_sha,
+            "FAIL_API": fail_api,
+            "PR_JSON_FILE": str(self.pr_file),
+            "API_CALLS_FILE": str(self.calls_file),
+        }
+        return subprocess.run(
+            ["bash", "-c", _workflow_step_script(PUBLISH_STEP)],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+
+    def _api_calls(self) -> list[dict[str, object]]:
+        return json.loads(self.calls_file.read_text(encoding="utf-8"))
+
+    def _status_calls(self) -> list[dict[str, object]]:
+        return [call for call in self._api_calls() if call["method"] == "POST"]
+
+    def test_publisher_permission_and_trigger_boundary(self) -> None:
+        publisher = _workflow_job_text("publish-head-status")
+        content = _workflow_job_text("content")
+        verify = _workflow_job_text("verify-dispatched-head")
+
+        self.assertIn("statuses: write", publisher)
+        self.assertIn("pull-requests: read", publisher)
+        self.assertIn("contents: read", publisher)
+        self.assertNotIn("statuses: write", content)
+        self.assertNotIn("statuses: write", verify)
+        self.assertIn(
+            "if: always() && !cancelled() && github.event_name == 'workflow_dispatch' "
+            "&& github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+            publisher,
+        )
+        self.assertIn("needs: [content, verify-dispatched-head]", publisher)
+        self.assertIn("cancel-in-progress: false", publisher)
+        self.assertNotIn("\n        uses:", publisher)
+        self.assertNotIn("checkout", publisher)
+        self.assertNotIn("artifact", publisher)
+        self.assertNotIn("cache", publisher)
+
+    def test_publisher_maps_success_and_job_failures(self) -> None:
+        cases = (
+            ("success", "success", "success", "validation passed"),
+            ("failure", "success", "failure", "content validation failed"),
+            ("success", "failure", "failure", "PR verification failed"),
+            (
+                "failure",
+                "failure",
+                "failure",
+                "content validation and PR verification failed",
+            ),
+        )
+        for content_result, verify_result, expected_state, phrase in cases:
+            with self.subTest(content=content_result, verify=verify_result):
+                self.calls_file.write_text("[]", encoding="utf-8")
+                result = self._run_publisher(
+                    content_result=content_result, verify_result=verify_result
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                status_calls = self._status_calls()
+                self.assertEqual(len(status_calls), 1)
+                status = status_calls[0]["params"]
+                self.assertEqual(status["state"], expected_state)
+                self.assertEqual(status["context"], "PR validation / dispatched-merge")
+                self.assertIn(self.target_sha[:12], status["description"])
+                self.assertIn("attempt 2", status["description"])
+                self.assertIn(phrase, status["description"])
+                self.assertEqual(
+                    status["target_url"],
+                    "https://github.com/teagramhq/.github/actions/runs/12345/attempts/2",
+                )
+
+    def test_publisher_suppresses_cancelled_or_skipped_results(self) -> None:
+        for content_result, verify_result in (
+            ("cancelled", "success"),
+            ("success", "cancelled"),
+            ("success", "skipped"),
+        ):
+            with self.subTest(content=content_result, verify=verify_result):
+                self.calls_file.write_text("[]", encoding="utf-8")
+                result = self._run_publisher(
+                    content_result=content_result, verify_result=verify_result
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self._status_calls(), [])
+
+    def test_stale_pr_head_or_target_never_publishes(self) -> None:
+        stale_head = self._run_publisher(pr_head_sha="c" * 40)
+        self.assertNotEqual(stale_head.returncode, 0)
+        self.assertEqual(self._status_calls(), [])
+
+        self.calls_file.write_text("[]", encoding="utf-8")
+        stale_target = self._run_publisher(live_target_sha="c" * 40)
+        self.assertNotEqual(stale_target.returncode, 0)
+        self.assertIn("Target branch advanced", stale_target.stdout)
+        self.assertEqual(self._status_calls(), [])
+
+    def test_invalid_repository_target_and_api_errors_never_publish(self) -> None:
+        cases = (
+            {"pr_state": "closed"},
+            {"pr_base_repository": "attacker.example/repo"},
+            {"pr_base_ref": "release"},
+            {"expected_target_ref": "release"},
+            {"expected_target_sha": "not-a-sha"},
+            {"fail_api": "pull"},
+            {"fail_api": "target"},
+        )
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs):
+                self.calls_file.write_text("[]", encoding="utf-8")
+                result = self._run_publisher(**kwargs)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self._status_calls(), [])
+
+    def test_status_api_error_fails_publication(self) -> None:
+        result = self._run_publisher(fail_api="status")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Could not publish", result.stdout)
+        self.assertEqual(len(self._status_calls()), 1)
+
+    def test_current_pair_retry_republishes_same_context_and_result(self) -> None:
+        first = self._run_publisher()
+        second = self._run_publisher()
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        status_calls = self._status_calls()
+        self.assertEqual(len(status_calls), 2)
+        self.assertEqual(status_calls[0], status_calls[1])
+        self.assertEqual(
+            status_calls[0]["endpoint"],
+            f"repos/teagramhq/.github/statuses/{self.head_sha}",
+        )
 
 
 if __name__ == "__main__":
