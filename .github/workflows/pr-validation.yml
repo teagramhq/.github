@@ -1,0 +1,137 @@
+name: PR validation
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches-ignore:
+      - main
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open pull request number to validate against its base
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  content:
+    name: content
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Resolve pull request revisions
+        id: revisions
+        if: github.event_name != 'push'
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::pr_number must be a positive integer"
+              exit 1
+            fi
+
+            pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")"
+            if [[ "$(jq -r '.state' <<<"$pr")" != "open" ]]; then
+              echo "::error::PR #$PR_NUMBER is not open"
+              exit 1
+            fi
+
+            base_sha="$(jq -r '.base.sha' <<<"$pr")"
+            head_sha="$(jq -r '.head.sha' <<<"$pr")"
+            head_repository="$(jq -r '.head.repo.full_name // empty' <<<"$pr")"
+          else
+            base_sha="$EVENT_BASE_SHA"
+            head_sha="$EVENT_HEAD_SHA"
+            head_repository="$EVENT_HEAD_REPOSITORY"
+          fi
+
+          if [[ -z "$base_sha" || -z "$head_sha" || -z "$head_repository" ]]; then
+            echo "::error::Could not resolve the pull request base and head"
+            exit 1
+          fi
+
+          {
+            echo "base_ref=$base_sha"
+            echo "base_sha=$base_sha"
+            echo "head_sha=$head_sha"
+            echo "head_repository=$head_repository"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve pushed branch revisions
+        id: branch_revisions
+        if: github.event_name == 'push'
+        env:
+          BASE_BRANCH: ${{ github.event.repository.default_branch }}
+          HEAD_SHA: ${{ github.sha }}
+          HEAD_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "base_ref=$BASE_BRANCH"
+            echo "head_sha=$HEAD_SHA"
+            echo "head_repository=$HEAD_REPOSITORY"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.revisions.outputs.base_ref || steps.branch_revisions.outputs.base_ref }}
+          path: base
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out candidate
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.revisions.outputs.head_repository || steps.branch_revisions.outputs.head_repository }}
+          ref: ${{ steps.revisions.outputs.head_sha || steps.branch_revisions.outputs.head_sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check PR whitespace and prepare its merge result
+        env:
+          BASE_SHA: ${{ steps.revisions.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.revisions.outputs.head_sha || steps.branch_revisions.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$BASE_SHA" ]]; then
+            BASE_SHA="$(git -C "$GITHUB_WORKSPACE/base" rev-parse HEAD)"
+          fi
+
+          actual_head="$(git -C "$GITHUB_WORKSPACE/candidate" rev-parse HEAD)"
+          if [[ "$actual_head" != "$HEAD_SHA" ]]; then
+            echo "::error::Checked out $actual_head but expected $HEAD_SHA"
+            exit 1
+          fi
+
+          git -C "$GITHUB_WORKSPACE/candidate" fetch --no-tags \
+            "$GITHUB_WORKSPACE/base" "$BASE_SHA:refs/remotes/base/target"
+          git -C "$GITHUB_WORKSPACE/candidate" diff --check "$BASE_SHA...$HEAD_SHA"
+          git -C "$GITHUB_WORKSPACE/candidate" merge --no-commit --no-ff --no-edit \
+            refs/remotes/base/target
+
+      - name: Run validator fixtures
+        working-directory: candidate
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Validate repository content
+        working-directory: candidate
+        run: python3 scripts/validate_brand_assets.py
