@@ -51,7 +51,7 @@ class PRMergePreparationTests(unittest.TestCase):
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": str(self.empty_git_config),
         }
-        identity = {
+        self.identity = {
             **self.environment,
             "GIT_AUTHOR_NAME": "Fixture",
             "GIT_AUTHOR_EMAIL": "fixture@example.test",
@@ -63,7 +63,7 @@ class PRMergePreparationTests(unittest.TestCase):
         self._git(self.base, "init", "--quiet", "-b", "main", env=self.environment)
         (self.base / "README.md").write_text("old candidate\n", encoding="utf-8")
         self._git(self.base, "add", "README.md", env=self.environment)
-        self._git(self.base, "commit", "--quiet", "-m", "initial", env=identity)
+        self._git(self.base, "commit", "--quiet", "-m", "initial", env=self.identity)
         subprocess.run(
             ["git", "clone", "--quiet", str(self.base), str(self.candidate)],
             check=True,
@@ -80,12 +80,19 @@ class PRMergePreparationTests(unittest.TestCase):
             "--quiet",
             "-m",
             "candidate change",
-            env=identity,
+            env=self.identity,
         )
 
         (self.base / "main-change.txt").write_text("main advanced\n", encoding="utf-8")
         self._git(self.base, "add", "main-change.txt", env=self.environment)
-        self._git(self.base, "commit", "--quiet", "-m", "advance main", env=identity)
+        self._git(
+            self.base,
+            "commit",
+            "--quiet",
+            "-m",
+            "advance main",
+            env=self.identity,
+        )
         self.base_sha = self._git(self.base, "rev-parse", "HEAD").stdout.strip()
         self.head_sha = self._git(self.candidate, "rev-parse", "HEAD").stdout.strip()
 
@@ -106,6 +113,21 @@ class PRMergePreparationTests(unittest.TestCase):
             env=env,
         )
 
+    def _run_merge_step(self) -> subprocess.CompletedProcess[str]:
+        environment = {
+            **self.environment,
+            "GITHUB_WORKSPACE": str(self.root),
+            "BASE_SHA": self.base_sha,
+            "HEAD_SHA": self.head_sha,
+        }
+        return subprocess.run(
+            ["bash", "-c", _merge_step_script()],
+            check=False,
+            text=True,
+            capture_output=True,
+            env=environment,
+        )
+
     def test_divergent_old_candidate_merges_without_candidate_ci_scripts(self) -> None:
         self.assertFalse((self.candidate / "scripts/prepare_pr_merge.py").exists())
         self._git(
@@ -122,19 +144,7 @@ class PRMergePreparationTests(unittest.TestCase):
         self.assertNotEqual(merge_base, self.base_sha)
         self.assertNotEqual(merge_base, self.head_sha)
 
-        environment = {
-            **self.environment,
-            "GITHUB_WORKSPACE": str(self.root),
-            "BASE_SHA": self.base_sha,
-            "HEAD_SHA": self.head_sha,
-        }
-        result = subprocess.run(
-            ["bash", "-c", _merge_step_script()],
-            check=False,
-            text=True,
-            capture_output=True,
-            env=environment,
-        )
+        result = self._run_merge_step()
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -149,6 +159,26 @@ class PRMergePreparationTests(unittest.TestCase):
             self._git(self.candidate, "rev-parse", "HEAD").stdout.strip(),
             self.head_sha,
         )
+
+    def test_candidate_trailing_whitespace_fails_validation(self) -> None:
+        (self.candidate / "pr-change.txt").write_text(
+            "candidate change \n", encoding="utf-8"
+        )
+        self._git(self.candidate, "add", "pr-change.txt", env=self.environment)
+        self._git(
+            self.candidate,
+            "commit",
+            "--amend",
+            "--quiet",
+            "--no-edit",
+            env=self.identity,
+        )
+        self.head_sha = self._git(self.candidate, "rev-parse", "HEAD").stdout.strip()
+
+        result = self._run_merge_step()
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("trailing whitespace", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
