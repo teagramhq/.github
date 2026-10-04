@@ -6,7 +6,7 @@
 
 The **T speech bubble**: the letter T whose stem ends in a speech-bubble tail. White on a tea-green gradient (`#3FD49A` to `#0E8A63`).
 
-Use it for the app icon, the GitHub avatar, favicons and anywhere Teagram needs a single mark.
+`t-primary` is the primary brand mark and an approved alternate app icon. Use it for the GitHub avatar, favicons and anywhere Teagram needs a single mark.
 
 ## Alternate colourways
 
@@ -24,7 +24,7 @@ Use it for the app icon, the GitHub avatar, favicons and anywhere Teagram needs 
 
 The **signal** version (`mug-signal`: signal arcs instead of steam) is the hero image on the organization page.
 
-A friendly secondary mark for stickers, empty states, docs and social posts. Never use it as the app icon or avatar, and never in orange.
+A friendly secondary mark for stickers, empty states, docs and social posts. `mug-signal` is the default macOS app icon. Never use a mug as an avatar or in orange.
 
 ## Files
 
