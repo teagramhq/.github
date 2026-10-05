@@ -17,7 +17,7 @@
 |---|---|---|
 | [teagram-server](https://github.com/teagramhq/teagram-server) | MTProto server in Go: accounts, private chats, groups, channels, folders and media, backed by Postgres | AGPL-3.0 |
 | [teagram-desktop](https://github.com/teagramhq/teagram-desktop) | macOS desktop client based on Telegram Desktop, set up for your own server | GPL-3.0 |
-| [telegram-web](https://github.com/teagramhq/telegram-web) | Web client based on Telegram Web K | GPL-3.0 |
+| [teagram-web](https://github.com/teagramhq/teagram-web) | Web client based on Telegram Web K | GPL-3.0 |
 
 ## Status
 
